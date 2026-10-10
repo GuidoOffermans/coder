@@ -60,11 +60,16 @@ resource "coder_agent" "main" {
     HOME_MANAGER_BACKUP_EXT=backup ~/.cache/hm-activate/activate
 
     # Load the flake's dev shell (Node, pnpm, Rust) whenever a shell enters the project
+    # Skipped while the project volume is still empty (clone the project into it first)
     cd ${local.project_path}
-    direnv allow
+    if [ -f .envrc ]; then
+      direnv allow
+    else
+      echo "No .envrc in ${local.project_path} yet; skipping direnv"
+    fi
 
     # Install JS dependencies on first start
-    if [ ! -d node_modules ]; then
+    if [ -f package.json ] && [ ! -d node_modules ]; then
       nix develop --command pnpm install
     fi
   EOT
