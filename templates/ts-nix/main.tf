@@ -227,6 +227,18 @@ resource "coder_app" "nvim" {
   order        = 4
 }
 
+# Runs your own ~/dotfiles/personalize script (if present and executable) on every start, for
+# tweaks that don't belong in the template. It lives in the dotfiles volume, so it's shared by
+# all your workspaces and versioned with your dotfiles; output goes to ~/personalize.log.
+# See https://registry.coder.com/modules/coder/personalize
+module "personalize" {
+  count    = data.coder_workspace.me.start_count
+  source   = "registry.coder.com/coder/personalize/coder"
+  version  = "~> 1.0"
+  agent_id = coder_agent.main.id
+  path     = "~/dotfiles/personalize"
+}
+
 # See https://registry.coder.com/modules/coder/code-server
 module "code-server" {
   count    = data.coder_workspace.me.start_count
