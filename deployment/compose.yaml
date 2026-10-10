@@ -1,3 +1,6 @@
+# Pinned so volumes stay coder_coder_data / coder_coder_home regardless of directory name.
+name: coder
+
 services:
   coder:
     # This MUST be stable for our documentation and
@@ -17,9 +20,9 @@ services:
     # lines and set the group ID to one that has write
     # permissions on the docker socket.
     group_add:
-      - "0" # Docker Desktop (Windows): socket is owned by root group
+      - "10" # Podman rootful machine: socket is owned by group 10 (wheel)
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /run/podman/podman.sock:/var/run/docker.sock
       # Run "docker volume rm coder_coder_home" to reset the dev tunnel url (https://abc.xyz.try.coder.app).
       # This volume is not required in a production environment - you may safely remove it.
       # Coder can recreate all the files it needs on restart.
@@ -30,7 +33,7 @@ services:
   database:
     # Minimum supported version is 13.
     # More versions here: https://hub.docker.com/_/postgres
-    image: "postgres:17"
+    image: "docker.io/library/postgres:17"
     # Uncomment the next two lines to allow connections to the database from outside the server.
     #ports:
     #  - "5432:5432"
