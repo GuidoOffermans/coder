@@ -117,6 +117,30 @@ resource "coder_agent" "main" {
   }
 }
 
+# Headless Neovim server in the project; attach from your machine with
+#   coder port-forward <workspace> --tcp 6666:6666
+#   nvim --server 127.0.0.1:6666 --remote-ui
+# Listens on localhost only: Neovim's RPC has no auth, the Coder tunnel does.
+# Restarted when it exits (e.g. :qa from a client), so it's always there to attach to.
+resource "coder_script" "nvim_server" {
+  agent_id     = coder_agent.main.id
+  display_name = "Neovim server"
+  icon         = "/icon/neovim.svg"
+  run_on_start = true
+  script       = <<-EOT
+    #!/usr/bin/env bash
+    nohup bash -c '
+      # home-manager installs nvim during the startup script
+      until command -v nvim >/dev/null; do sleep 2; done
+      cd ${local.project_path}
+      while true; do
+        nvim --headless --listen 127.0.0.1:6666
+        sleep 1
+      done
+    ' >/tmp/nvim-server.log 2>&1 &
+  EOT
+}
+
 # See https://registry.coder.com/modules/coder/code-server
 module "code-server" {
   count    = data.coder_workspace.me.start_count
