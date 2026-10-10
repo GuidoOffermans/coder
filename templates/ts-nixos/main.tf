@@ -14,14 +14,15 @@ terraform {
 #   - volume ts-nix-src                          (the project's code)
 #   - volume coder-nixos-store                   (shared Nix store: every Nix package;
 #                                                 Podman creates it on first use)
-#   - volume coder-dotfiles                      (personal home-manager config, git repo;
-#                                                 filled from ./dotfiles if empty)
+#   - volume coder-<owner>-dotfiles              (that user's dotfiles, git repo; on first use
+#                                                 cloned from the Dotfiles repository parameter,
+#                                                 or filled from ./dotfiles; Podman creates it)
 # This template never creates or deletes them, so deleting a workspace keeps your code.
 locals {
   image           = "localhost/ts-nixos-workspace:latest"
   src_volume      = "ts-nix-src"
   nix_volume      = "coder-nixos-store"
-  dotfiles_volume = "coder-dotfiles"
+  dotfiles_volume = lower("coder-${data.coder_workspace_owner.me.name}-dotfiles")
   project_path = "/home/coder/ts-nix"
 
   # Postgres sidecar, reachable from the workspace as db:5432 (not exposed on the host)
@@ -37,28 +38,99 @@ data "coder_provisioner" "me" {}
 data "coder_workspace" "me" {}
 data "coder_workspace_owner" "me" {}
 
+data "coder_parameter" "dotfiles_url" {
+  name         = "dotfiles_url"
+  display_name = "Dotfiles repository"
+  description  = <<-EOT
+    Git URL of your dotfiles; leave empty for the starter config. A home-manager flake with
+    `homeConfigurations.coder` is applied with home-manager. Anything else gets a base toolset,
+    then its install.sh (or bootstrap.sh / setup.sh) runs, or its dotfiles are symlinked into ~.
+    Only used while your dotfiles volume is empty: after that ~/dotfiles is yours.
+  EOT
+  type         = "string"
+  default      = ""
+  mutable      = true
+  icon         = "/icon/dotfiles.svg"
+}
+
 resource "coder_agent" "main" {
   arch           = data.coder_provisioner.me.arch
   os             = "linux"
+
+  # The vscode module below has the VS Code button (it opens the project folder); hide the
+  # built-in one, which opens the home folder
+  display_apps {
+    vscode = false
+  }
+
   startup_script = <<-EOT
     set -e
 
-    # First start with an empty dotfiles volume: fill it from the starter copy in ./dotfiles
-    # next to this template. After that, ~/dotfiles is yours; the template never overwrites it.
-    if [ ! -f ~/dotfiles/flake.nix ]; then
-      %{~for f in fileset("${path.module}/dotfiles", "**")}
-      mkdir -p "$(dirname ~/dotfiles/${f})"
-      echo '${filebase64("${path.module}/dotfiles/${f}")}' | base64 -d > ~/dotfiles/${f}
-      %{~endfor}
-      git -C ~/dotfiles init -q -b main
-      git -C ~/dotfiles add -A
-      git -C ~/dotfiles commit -q -m "Initial dotfiles from the ts-nixos template"
+    # First start with an empty dotfiles volume: clone the Dotfiles repository parameter, or
+    # fill it from the starter copy in ./dotfiles next to this template. After that, ~/dotfiles
+    # is yours; the template never overwrites it.
+    if [ -z "$(ls -A ~/dotfiles)" ]; then
+      if [ -n "$DOTFILES_URL" ]; then
+        git clone "$DOTFILES_URL" ~/dotfiles
+      else
+        %{~for f in fileset("${path.module}/dotfiles", "**")}
+        mkdir -p "$(dirname ~/dotfiles/${f})"
+        echo '${filebase64("${path.module}/dotfiles/${f}")}' | base64 -d > ~/dotfiles/${f}
+        %{~endfor}
+        git -C ~/dotfiles init -q -b main
+        git -C ~/dotfiles add -A
+        git -C ~/dotfiles commit -q -m "Initial dotfiles from the ts-nixos template"
+      fi
+    elif [ -n "$DOTFILES_URL" ] && [ "$(git -C ~/dotfiles remote get-url origin 2>/dev/null)" != "$DOTFILES_URL" ]; then
+      echo "~/dotfiles already has content, so the Dotfiles repository setting is not used" >&2
     fi
 
-    # Apply the personal environment (zsh, direnv, git, ...) from ~/dotfiles via home-manager.
+    # A home-manager flake (homeConfigurations.coder, like the starter) sets up everything.
+    # Other dotfiles get the base toolset from ./base (packages only, no files) via home-manager,
+    # then are applied below the way `coder dotfiles` does it.
+    if [ -f ~/dotfiles/flake.nix ] &&
+       [ "$(nix eval --raw ~/dotfiles#homeConfigurations --apply 'c: if c ? coder then "yes" else "no"' 2>/dev/null)" = yes ]; then
+      hm_flake=~/dotfiles
+    else
+      hm_flake=~/.local/share/coder-base
+      rm -rf "$hm_flake"
+      %{~for f in fileset("${path.module}/base", "**")}
+      mkdir -p "$(dirname "$hm_flake/${f}")"
+      echo '${filebase64("${path.module}/base/${f}")}' | base64 -d > "$hm_flake/${f}"
+      %{~endfor}
+    fi
+
     # Existing non-managed dotfiles are moved aside with a .backup suffix.
-    nix build ~/dotfiles#homeConfigurations.coder.activationPackage -o ~/.cache/hm-activate
+    nix build "$hm_flake#homeConfigurations.coder.activationPackage" -o ~/.cache/hm-activate
     HOME_MANAGER_BACKUP_EXT=backup ~/.cache/hm-activate/activate
+
+    # Plain dotfiles: run the first install script found (re-run every start, so keep it
+    # idempotent), otherwise symlink the repo's dotfiles into ~
+    if [ "$hm_flake" != ~/dotfiles ]; then
+      cd ~/dotfiles
+      installer=""
+      for s in install.sh install bootstrap.sh bootstrap script/bootstrap setup.sh setup script/setup; do
+        if [ -f "$s" ]; then installer="$s"; break; fi
+      done
+      if [ -n "$installer" ]; then
+        echo "Running $installer from your dotfiles"
+        if [ -x "$installer" ]; then "./$installer"; else bash "$installer"; fi
+      else
+        for f in .[!.]* ..?*; do
+          [ -e "$f" ] || continue
+          case "$f" in .git|.github|.gitignore) continue ;; esac
+          if [ -e ~/"$f" ] && [ ! -L ~/"$f" ]; then
+            if [ -e ~/"$f.backup" ]; then
+              echo "Skipping $f: ~/$f and ~/$f.backup both exist" >&2
+              continue
+            fi
+            mv ~/"$f" ~/"$f.backup"
+          fi
+          ln -sfn ~/dotfiles/"$f" ~/"$f"
+        done
+      fi
+      cd ~
+    fi
 
     # Load the flake's dev shell (Node, pnpm, Rust) whenever a shell enters the project
     # Skipped while the project volume is still empty (clone the project into it first)
@@ -90,6 +162,9 @@ resource "coder_agent" "main" {
     GIT_AUTHOR_EMAIL    = data.coder_workspace_owner.me.email
     GIT_COMMITTER_NAME  = coalesce(data.coder_workspace_owner.me.full_name, data.coder_workspace_owner.me.name)
     GIT_COMMITTER_EMAIL = data.coder_workspace_owner.me.email
+
+    # Read by the startup script on first start (see data.coder_parameter.dotfiles_url)
+    DOTFILES_URL = data.coder_parameter.dotfiles_url.value
   }
 
   metadata {
@@ -139,6 +214,18 @@ resource "coder_script" "nvim_server" {
       done
     ' >/tmp/nvim-server.log 2>&1 &
   EOT
+}
+
+# Opens your local Neovim attached to that server. Needs the nvim-coder:// handler on your
+# machine: run client/nvim-coder/install.ps1 from this repo once.
+resource "coder_app" "nvim" {
+  agent_id     = coder_agent.main.id
+  slug         = "nvim"
+  display_name = "Neovim"
+  icon         = "https://neovim.io/logos/neovim-mark-flat.svg"
+  external     = true
+  url          = "nvim-coder://open/${data.coder_workspace_owner.me.name}/${data.coder_workspace.me.name}"
+  order        = 4
 }
 
 # See https://registry.coder.com/modules/coder/code-server
